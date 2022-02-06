@@ -1,5 +1,10 @@
 [package]
-name = "update-pkg-metadata"
+name = "cb-project-metadata-updater"
+homepage = "https://github.com/alexanderpolson/cb-project-metadata-updater"
+repository  = "https://github.com/alexanderpolson/cb-project-metadata-updater"
+documentation = "https://github.com/alexanderpolson/cb-project-metadata-updater"
+description = "Tracks relationships between source code and their AWS Code Build projects to coordinate rebuilds of consumers when changes are made."
+license = "MIT"
 version = "0.1.0"
 edition = "2021"
 
