@@ -2,7 +2,7 @@ use aws_config::Config;
 use aws_sdk_codebuild::{Client as CodeBuildClient, SdkError as CodeBuildError};
 use aws_sdk_dynamodb::{Client as DynamoDbClient, SdkError as DynamoDbError};
 use aws_sdk_dynamodb::model::{AttributeValue, AttributeValueUpdate, ReturnValue};
-use futures::future::{BoxFuture, try_join_all};
+use futures::future::try_join_all;
 use crate::{CrateHelper, crate_helper};
 use crate::crate_helper::Dependency;
 
@@ -55,36 +55,14 @@ impl CrateMetadataUpdater {
                         tracked_deps.push(tracked_dep);
                     }
                 }
+                tracked_deps
             },
             Err(err) => return Err(err)
         };
 
-        self.update_project(&primary_key, &build_details, &crt);
-        Ok(())
-    }
-
-    async fn update_project(&self, primary_key: &String, build_details: &BuildDetails, crt: &CrateHelper) -> Result<(), crate_helper::Error> {
-        match self.ddb.update_item()
-            .table_name(String::from(DYNAMO_DB_TABLE))
-            .key("package_name", AttributeValue::S(primary_key.clone()))
-            .attribute_updates("code_build_project_name",
-                               AttributeValueUpdate::builder()
-                                   .value(AttributeValue::S(build_details.build_project_name.clone()))
-                                   .build())
-            .attribute_updates("dependencies",
-                               AttributeValueUpdate::builder()
-                                   .value(AttributeValue::Ss(dependency_primary_keys(&crt)))
-                                   .build())
-            .send().await {
-            Ok(response) => {
-                eprintln!("{:?}", response);
-                Ok(())
-            },
-            Err(err) => {
-                return Err(crate_helper::Error {
-                    msg: err.to_string()
-                })
-            }
+        match self.update_project(&primary_key, &build_details, tracked_deps).await {
+            Ok(_) => Ok(()),
+            Err(err) => return Err(err)
         }
     }
 
@@ -125,18 +103,34 @@ impl CrateMetadataUpdater {
             }
         }
     }
+
+    async fn update_project(&self, primary_key: &String, build_details: &BuildDetails, tracked_deps: Vec<String>) -> Result<(), crate_helper::Error> {
+        match self.ddb.update_item()
+            .table_name(String::from(DYNAMO_DB_TABLE))
+            .key("package_name", AttributeValue::S(primary_key.clone()))
+            .attribute_updates("code_build_project_name",
+                               AttributeValueUpdate::builder()
+                                   .value(AttributeValue::S(build_details.build_project_name.clone()))
+                                   .build())
+            .attribute_updates("dependencies",
+                               AttributeValueUpdate::builder()
+                                   .value(AttributeValue::Ss(tracked_deps))
+                                   .build())
+            // TODO: Pull old attributes so that any removed dependencies can be cleaned up.
+            .send().await {
+            Ok(response) => {
+                eprintln!("{:?}", response);
+                Ok(())
+            },
+            Err(err) => {
+                return Err(crate_helper::Error {
+                    msg: err.to_string()
+                })
+            }
+        }
+    }
 }
 
 fn get_primary_key(crate_name: &String, version: &String) -> String {
     format!("{}/{}/{}", LANGUAGE, crate_name, version)
-}
-
-fn dependency_primary_keys(crt: &CrateHelper) -> Vec<String> {
-    let mut primary_keys: Vec<String> = vec![];
-    for dep in &crt.dependencies {
-        if let Some(version) = &dep.version {
-            primary_keys.push(get_primary_key(&dep.name, &version));
-        }
-    }
-    primary_keys
 }
