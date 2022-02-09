@@ -1,5 +1,6 @@
 use aws_config::Config;
-use aws_sdk_dynamodb::{Client as DynamoDbClient, SdkError};
+use aws_sdk_codebuild::{Client as CodeBuildClient, SdkError as CodeBuildError};
+use aws_sdk_dynamodb::{Client as DynamoDbClient, SdkError as DynamoDbError};
 use aws_sdk_dynamodb::model::{AttributeValue, AttributeValueUpdate};
 use futures::future::{BoxFuture, try_join_all};
 use crate::{CrateHelper, crate_helper};
@@ -13,13 +14,15 @@ pub struct BuildDetails {
 }
 
 pub struct CrateMetadataUpdater {
-    ddb: DynamoDbClient
+    ddb: DynamoDbClient,
+    codebuild: CodeBuildClient,
 }
 
 impl CrateMetadataUpdater {
     pub fn new(client_config: &Config) -> CrateMetadataUpdater {
         CrateMetadataUpdater {
-            ddb: DynamoDbClient::new(client_config)
+            ddb: DynamoDbClient::new(client_config),
+            codebuild: CodeBuildClient::new(client_config),
         }
     }
 
@@ -83,7 +86,7 @@ impl CrateMetadataUpdater {
                     Ok(_) => log::info!("{} added.", fq_dep_name),
                     Err(err) => {
                         match err {
-                            SdkError::ServiceError {err, ..} => {
+                            DynamoDbError::ServiceError {err, ..} => {
                                 if err.is_conditional_check_failed_exception() {
                                     eprintln!("{} not being tracked. Skipping...", fq_dep_name)
                                 } else {
