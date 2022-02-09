@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use aws_config::Config;
-use aws_sdk_codebuild::{Client as CodeBuildClient, SdkError as CodeBuildError};
+use aws_sdk_codebuild::{Client as CodeBuildClient};
 use aws_sdk_dynamodb::{Client as DynamoDbClient, SdkError as DynamoDbError};
 use aws_sdk_dynamodb::model::{AttributeAction, AttributeValue, AttributeValueUpdate, ReturnValue};
 use futures::future::try_join_all;
@@ -150,11 +150,14 @@ impl CrateMetadataUpdater {
                     }
                     if let Some(consumers_av) = old_attributes.get(KEY_CONSUMERS) {
                         if let Ok(consumers) = consumers_av.as_ss() {
-                            // TODO: Kick off builds for each of this crate's consumers.
                             println!("Consumers: {:?}", consumers_av);
-                            // TODO: Check if this is actually a consumer of this package (edge case if metadata update fails).
-                            for consumer in consumers {
-
+                            let mut project_build_futures = vec![];
+                            for consumer_key in consumers {
+                                project_build_futures.push(Box::pin(self.rebuild_consumer(primary_key, consumer_key)));
+                            }
+                            match try_join_all(project_build_futures).await {
+                                Ok(_) => (),
+                                Err(err) => return Err(err),
                             }
                         }
                     }
@@ -194,6 +197,40 @@ impl CrateMetadataUpdater {
                     _ => return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
                 }
             }
+        }
+    }
+
+    async fn rebuild_consumer(&self, primary_key: &String, consumer_key: &String) -> Result<(), crate_helper::Error> {
+        eprintln!("Checking to see if {} needs to be rebuilt due to update to {}.", consumer_key, primary_key);
+        match self.ddb.get_item()
+            .table_name(String::from(DYNAMO_DB_TABLE))
+            .key(KEY_PACKAGE_NAME, AttributeValue::S(consumer_key.clone()))
+            .send().await {
+            Ok(response) => {
+                eprintln!("Found record for {}: {:?}", consumer_key, response);
+                if let Some(item) = response.item {
+                    if let Some(dependencies_av) = item.get(KEY_DEPENDENCIES) {
+                        if let Ok(dependencies) = dependencies_av.as_ss() {
+                            eprintln!("Found the following dependencies for {}: {:?}", primary_key, dependencies);
+                            if dependencies.contains(primary_key) {
+                                if let Some(cb_build_project_av) = item.get(KEY_CODE_BUILD_PROJECT_NAME) {
+                                    if let Ok(cb_build_project_name) = cb_build_project_av.as_s() {
+                                        return match self.codebuild.start_build().project_name(cb_build_project_name).send().await {
+                                            Ok(_) => {
+                                                eprintln!("Kicked off rebuild of consumer {} (CB project {}", consumer_key, cb_build_project_name);
+                                                Ok(())
+                                            },
+                                            Err(err) => return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            },
+            Err(err) => Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
         }
     }
 }
