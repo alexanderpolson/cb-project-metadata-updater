@@ -7,6 +7,7 @@ use crate::crate_helper::CrateHelper;
 use crate::metadata_updater::{BuildDetails, CrateMetadataUpdater};
 
 const ENV_CODEBUILD_BUILD_ID: &str = "CODEBUILD_BUILD_ID";
+const ENV_PKG_METADATA_TABLE: &str = "PKG_METADATA_TABLE";
 
 #[tokio::main]
 async fn main() {
@@ -24,9 +25,13 @@ async fn update_metadata() -> Result<(), crate_helper::Error> {
 
     let region_provider = RegionProviderChain::default_provider().or_else("us-west-2");
     let config = aws_config::from_env().region(region_provider).load().await;
-    let updater = CrateMetadataUpdater::new(&config);
-
-    updater.update_metadata(build_details, String::from("./Cargo.toml")).await
+    match std::env::var(ENV_PKG_METADATA_TABLE) {
+        Ok(table_value) => {
+            let updater = CrateMetadataUpdater::new(&config, table_value);
+            updater.update_metadata(build_details, String::from("./Cargo.toml")).await
+        },
+        Err(_) => Err(crate_helper::Error::with_msg(format!("Unable to determine Package Metadata table name from {} env variable", ENV_PKG_METADATA_TABLE)))
+    }
 }
 
 fn get_build_details() -> Result<BuildDetails, crate_helper::Error> {
