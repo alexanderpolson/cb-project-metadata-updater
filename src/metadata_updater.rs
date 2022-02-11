@@ -22,13 +22,15 @@ pub struct BuildDetails {
 pub struct CrateMetadataUpdater {
     ddb: DynamoDbClient,
     codebuild: CodeBuildClient,
+    pkg_metadata_table: String,
 }
 
 impl CrateMetadataUpdater {
-    pub fn new(client_config: &Config) -> CrateMetadataUpdater {
+    pub fn new(client_config: &Config, pkg_metadata_table: String) -> CrateMetadataUpdater {
         CrateMetadataUpdater {
             ddb: DynamoDbClient::new(client_config),
             codebuild: CodeBuildClient::new(client_config),
+            pkg_metadata_table,
         }
     }
 
@@ -72,6 +74,11 @@ impl CrateMetadataUpdater {
     }
 
     async fn add_consumer_to_dependency(&self, primary_key: &String, dep: &Dependency) -> Result<Option<String>, crate_helper::Error> {
+        // TODO: Need to update all dependencies that match the version pattern.
+        // When adding a consumer, it needs to be added to all matching versions.
+        // NOTE: This probably isn't entirely true, but makes things a bit easier.
+        // Crate: https://docs.rs/semver/latest/semver/index.html
+        // https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html
         match &dep.version {
             Some(version) => {
                 // If a record for this dependency exists, then add the current crate as a consumer
@@ -110,6 +117,13 @@ impl CrateMetadataUpdater {
     }
 
     async fn update_project(&self, primary_key: &String, build_details: &BuildDetails, tracked_deps: Vec<String>) -> Result<(), crate_helper::Error> {
+        // TODO: Always update the specific version.
+        // We won't (and shouldn't) try and rebuild all projects that would consume a new version as
+        // the actual versions being used by the consumer should be locked, until it's rebuilt, at
+        // which point, it will grab the appropriate version and add itself as a consumer to that
+        // version.
+        // Also, the single CodeBuild project per codebase doesn't work if multiple versions of the
+        // package are active. For example, v1 and v2 and applying patches to both versions.
         let tracked_deps_set = to_set(&tracked_deps);
         let dep_attribute_update = if tracked_deps.is_empty() {
             // If tracked_deps is empty, delete the dependencies value.
