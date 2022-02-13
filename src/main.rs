@@ -2,6 +2,7 @@ mod crate_helper;
 mod metadata_updater;
 
 use std::env;
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_config::meta::region::RegionProviderChain;
 use crate::crate_helper::CrateHelper;
 use crate::metadata_updater::{BuildDetails, CrateMetadataUpdater};
@@ -23,10 +24,21 @@ async fn update_metadata() -> Result<(), crate_helper::Error> {
         Err(err) => return Err(err)
     };
 
-    let region_provider = RegionProviderChain::default_provider().or_else("us-west-2");
-    let config = aws_config::from_env().region(region_provider).load().await;
+    // This is a hack for quick support for local profiles. Arguments should be properly fleshed out
+    let mut credential_chain =
+        DefaultCredentialsChain::builder()
+            .region(RegionProviderChain::default_provider().or_else("us-west-2"));
+    let args: Vec<String> = env::args().collect();
+    if let Some(profile_name) = args.get(1) {
+        eprintln!("Using AWS profile \"{}\"", profile_name);
+        credential_chain = credential_chain.profile_name(profile_name);
+    }
+    let config =
+        aws_config::from_env()
+            .credentials_provider(credential_chain.build().await).load().await;
     match std::env::var(ENV_PKG_METADATA_TABLE) {
         Ok(table_value) => {
+            eprintln!("Writing changes to {} table.", table_value);
             let updater = CrateMetadataUpdater::new(&config, table_value);
             updater.update_metadata(build_details, String::from("./Cargo.toml")).await
         },
