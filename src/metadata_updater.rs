@@ -4,20 +4,85 @@ use aws_sdk_codebuild::{Client as CodeBuildClient};
 use aws_sdk_dynamodb::{Client as DynamoDbClient, SdkError as DynamoDbError};
 use aws_sdk_dynamodb::model::{AttributeAction, AttributeValue, AttributeValueUpdate, ReturnValue};
 use futures::future::try_join_all;
+use once_cell::sync::OnceCell;
+use regex::Regex;
 use crate::{CrateHelper, crate_helper};
-use crate::crate_helper::Dependency;
+use crate::crate_helper::{Dependency, Error};
 
-const LANGUAGE: &str = "rust";
+const BUILD_SYSTEM: &str = "rust";
 
 const KEY_CODE_BUILD_PROJECT_NAME: &str = "code_build_project_name";
 const KEY_PACKAGE_NAME: &str = "package_name";
 const KEY_VERSION: &str = "version";
 const KEY_CONSUMERS: &str = "consumers";
 const KEY_DEPENDENCIES: &str = "dependencies";
-const KEY_DELIMITER: &str = ":";
+const KEY_BUILD_SYSTEM_AND_NAME_DELIMITER: &str = "/";
+const KEY_NAME_AND_VERSION_DELIMITER: &str = ":";
+
+const PKG_KEY_REGEX: &str = "(.+)/(.+):(.+)";
+
+fn package_key_pattern() -> &'static Regex {
+    static INSTANCE: OnceCell<Regex> = OnceCell::new();
+    INSTANCE.get_or_init(|| Regex::new(PKG_KEY_REGEX).unwrap())
+}
 
 pub struct BuildDetails {
     pub build_project_name: String
+}
+
+pub struct PackageKey {
+    pub build_system: String,
+    pub name: String,
+    pub version: String,
+}
+
+impl PackageKey {
+    pub fn from(fq_key: &String) -> Result<PackageKey, Error> {
+        match package_key_pattern().captures(fq_key) {
+            Some(match_elements) => {
+                let build_system = String::from(match_elements.get(1).map(|m| m.as_str()).expect("Expected build system to be present"));
+                let name = String::from(match_elements.get(2).map(|m| m.as_str()).expect("Expected package name to be present."));
+                let version = String::from(match_elements.get(3).map(|m| m.as_str()).expect("Expected version to be present."));
+                Ok(PackageKey {
+                    build_system,
+                    name,
+                    version,
+                })
+            },
+            None => Err(Error::with_msg(format!("Fully qualified key \"{}\" is in unexpected format.", fq_key)))
+        }
+    }
+
+    pub fn to_fq_key(&self) -> String {
+        format!("{}{}{}{}{}", self.build_system, KEY_BUILD_SYSTEM_AND_NAME_DELIMITER, self.name, KEY_NAME_AND_VERSION_DELIMITER, self.version)
+    }
+
+    fn ddb_primary_key(&self) -> HashMap<String, AttributeValue> {
+        let mut key: HashMap<String, AttributeValue> = HashMap::new();
+        key.insert(String::from(KEY_PACKAGE_NAME), AttributeValue::S(format!("{}/{}", self.build_system, self.name)));
+        key.insert(String::from(KEY_VERSION), AttributeValue::S(self.version.clone()));
+        key
+    }
+}
+
+fn to_set(vec: &Vec<String>) -> HashSet<String> {
+    let mut set: HashSet<String> = HashSet::new();
+    for element in vec {
+        set.insert(element.clone());
+    }
+    set
+}
+
+// This will return a specific, concrete version of a crate.
+fn get_primary_key(name: &String, version: &String) -> HashMap<String, AttributeValue> {
+    let mut key: HashMap<String, AttributeValue> = HashMap::new();
+    key.insert(String::from(KEY_PACKAGE_NAME), AttributeValue::S(format!("{}/{}", BUILD_SYSTEM, name)));
+    key.insert(String::from(KEY_VERSION), AttributeValue::S(version.clone()));
+    key
+}
+
+fn get_encoded_primary_key(name: &String, version: &String) -> String {
+    format!("{}/{}{}{}", BUILD_SYSTEM, name, KEY_NAME_AND_VERSION_DELIMITER, version)
 }
 
 pub struct CrateMetadataUpdater {
@@ -49,11 +114,10 @@ impl CrateMetadataUpdater {
         for dep in &crt.dependencies {
             dep_update_futures.push(Box::pin(self.add_consumer_to_dependency(&crt, dep)));
         }
-        // TODO: Get list of consumers of this package.
-        // TODO: Kick off builds for each of the consumer projects.
+
         let tracked_deps = match try_join_all(dep_update_futures).await {
             Ok(deps) => {
-                let mut tracked_deps: Vec<String> = vec![];
+                let mut tracked_deps = vec![];
                 for dep in deps {
                     if let Some(tracked_dep) = dep {
                         tracked_deps.push(tracked_dep);
@@ -152,7 +216,10 @@ impl CrateMetadataUpdater {
                             // Clean up old dependencies that should no longer exist.
                             let mut dep_rm_futures = vec![];
                             for old_dep in old_deps_set.difference(&tracked_deps_set) {
-                                dep_rm_futures.push(Box::pin(self.rm_consumer_from_dependency(&crt, old_dep)));
+                                match PackageKey::from(&old_dep) {
+                                    Ok(old_dep_key) => dep_rm_futures.push(Box::pin(self.rm_consumer_from_dependency(&crt, old_dep_key))),
+                                    Err(err) => return Err(err),
+                                }
                             }
                             if !dep_rm_futures.is_empty() {
                                 match try_join_all(dep_rm_futures).await {
@@ -186,41 +253,36 @@ impl CrateMetadataUpdater {
         }
     }
 
-    async fn rm_consumer_from_dependency(&self, crt: &CrateHelper, old_dep: &String) -> Result<(), crate_helper::Error> {
+    async fn rm_consumer_from_dependency(&self, crt: &CrateHelper, old_dep_key: PackageKey) -> Result<(), crate_helper::Error> {
         let consumer_key = get_encoded_primary_key(&crt.name(), &crt.version());
-        match decode_primary_key(old_dep) {
-            Ok((dep_name, dep_version)) => {
-                eprintln!("Trying to remove {} as consumer of {} version {}.", consumer_key, dep_name, dep_version);
-                let dep_primary_key = get_primary_key(&dep_name, &dep_version);
-                eprintln!("Dep primary key: {:?}", dep_primary_key);
-                match self.ddb.update_item()
-                    .table_name(self.pkg_metadata_table.clone())
-                    // At this point we already know that the dependency's version is defined. If it's not
-                    // then this function isn't being called correctly.
-                    .set_key(Some(dep_primary_key))
-                    .update_expression(format!("DELETE {} :d", KEY_CONSUMERS))
-                    .expression_attribute_values(":d", AttributeValue::Ss(vec![consumer_key.clone()]))
-                    .condition_expression(format!("attribute_exists({})", KEY_PACKAGE_NAME)).send().await {
-                    Ok(_) => {
-                        log::info!("{} removed as consumer of {} version {}.", consumer_key, dep_name, dep_version);
-                        Ok(())
-                    },
-                    Err(err) => {
-                        match err {
-                            DynamoDbError::ServiceError { err, .. } => {
-                                if err.is_conditional_check_failed_exception() {
-                                    eprintln!("{} version {} not being tracked. Skipping...", dep_name, dep_version);
-                                    Ok(())
-                                } else {
-                                    return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
-                                }
-                            },
-                            _ => return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
+        let fq_dep_key = old_dep_key.to_fq_key();
+        eprintln!("Trying to remove {} as consumer of {}.", consumer_key, fq_dep_key);
+        let dep_primary_key = old_dep_key.ddb_primary_key();
+        match self.ddb.update_item()
+            .table_name(self.pkg_metadata_table.clone())
+            // At this point we already know that the dependency's version is defined. If it's not
+            // then this function isn't being called correctly.
+            .set_key(Some(dep_primary_key))
+            .update_expression(format!("DELETE {} :d", KEY_CONSUMERS))
+            .expression_attribute_values(":d", AttributeValue::Ss(vec![consumer_key.clone()]))
+            .condition_expression(format!("attribute_exists({})", KEY_PACKAGE_NAME)).send().await {
+            Ok(_) => {
+                log::info!("{} removed as consumer of {}.", consumer_key, fq_dep_key);
+                Ok(())
+            },
+            Err(err) => {
+                match err {
+                    DynamoDbError::ServiceError { err, .. } => {
+                        if err.is_conditional_check_failed_exception() {
+                            eprintln!("{}  not being tracked. Skipping...", fq_dep_key);
+                            Ok(())
+                        } else {
+                            return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
                         }
-                    }
+                    },
+                    _ => return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
                 }
             }
-            Err(err) => Err(err)
         }
     }
 
@@ -258,43 +320,4 @@ impl CrateMetadataUpdater {
             Err(err) => Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
         }
     }
-}
-
-fn to_set(vec: &Vec<String>) -> HashSet<String> {
-    let mut set: HashSet<String> = HashSet::new();
-    for element in vec {
-        set.insert(element.clone());
-    }
-    set
-}
-
-// This will return a specific, concrete version of a crate.
-fn get_primary_key(name: &String, version: &String) -> HashMap<String, AttributeValue> {
-    let mut key: HashMap<String, AttributeValue> = HashMap::new();
-    key.insert(String::from(KEY_PACKAGE_NAME), AttributeValue::S(format!("{}/{}", LANGUAGE, name)));
-    key.insert(String::from(KEY_VERSION), AttributeValue::S(version.clone()));
-    key
-}
-
-fn get_encoded_primary_key(name: &String, version: &String) -> String {
-    format!("{}/{}{}{}", LANGUAGE, name, KEY_DELIMITER, version)
-}
-
-fn decode_primary_key(primary_key: &String) -> Result<(String, String), crate_helper::Error> {
-    let key_parts: Vec<&str> = primary_key.split(KEY_DELIMITER).collect();
-    if key_parts.len() == 2 {
-        if let Some(name) = key_parts.get(0) {
-            if let Some(value) = key_parts.get(1) {
-                return Ok((String::from(*name), String::from(*value)));
-            }
-        }
-    }
-    Err(crate_helper::Error::with_msg(format!("Cannot decode primary key from \"{}\"", primary_key)))
-}
-
-// This will return all versions of a crate.
-fn query_key(crt: &CrateHelper) -> HashMap<String, AttributeValue> {
-    let mut key: HashMap<String, AttributeValue> = HashMap::new();
-    key.insert(String::from(KEY_PACKAGE_NAME), AttributeValue::S(format!("{}/{}", LANGUAGE, crt.name())));
-    key
 }
