@@ -37,7 +37,7 @@ pub struct PackageKey {
 }
 
 impl PackageKey {
-    pub fn from(fq_key: &String) -> Result<PackageKey, Error> {
+    pub fn from_fq_key(fq_key: &String) -> Result<PackageKey, Error> {
         match package_key_pattern().captures(fq_key) {
             Some(match_elements) => {
                 let build_system = String::from(match_elements.get(1).map(|m| m.as_str()).expect("Expected build system to be present"));
@@ -65,20 +65,22 @@ impl PackageKey {
     }
 }
 
+impl From<CrateHelper> for PackageKey {
+    fn from(crate_helper: CrateHelper) -> Self {
+        PackageKey {
+            build_system: String::from(BUILD_SYSTEM),
+            name: crate_helper.name(),
+            version: crate_helper.version(),
+        }
+    }
+}
+
 fn to_set(vec: &Vec<String>) -> HashSet<String> {
     let mut set: HashSet<String> = HashSet::new();
     for element in vec {
         set.insert(element.clone());
     }
     set
-}
-
-// This will return a specific, concrete version of a crate.
-fn get_primary_key(name: &String, version: &String) -> HashMap<String, AttributeValue> {
-    let mut key: HashMap<String, AttributeValue> = HashMap::new();
-    key.insert(String::from(KEY_PACKAGE_NAME), AttributeValue::S(format!("{}/{}", BUILD_SYSTEM, name)));
-    key.insert(String::from(KEY_VERSION), AttributeValue::S(version.clone()));
-    key
 }
 
 fn get_encoded_primary_key(name: &String, version: &String) -> String {
@@ -128,7 +130,8 @@ impl CrateMetadataUpdater {
             Err(err) => return Err(err)
         };
 
-        match self.update_project(&crt, &build_details, tracked_deps).await {
+        let pkg_key = PackageKey::from(crt);
+        match self.update_project(&pkg_key, &build_details, tracked_deps).await {
             Ok(_) => Ok(()),
             Err(err) => return Err(err)
         }
@@ -148,9 +151,14 @@ impl CrateMetadataUpdater {
                 // If a record for this dependency exists, then add the current crate as a consumer
                 // of it.
                 let fq_dep_name = get_encoded_primary_key(&dep.name, &version);
+                let dep_key = PackageKey {
+                    build_system: String::from(BUILD_SYSTEM),
+                    name: dep.name.clone(),
+                    version: version.clone(),
+                };
                 match self.ddb.update_item()
                     .table_name(self.pkg_metadata_table.clone())
-                    .set_key(Some(get_primary_key(&dep.name, &version)))
+                    .set_key(Some(dep_key.ddb_primary_key()))
                     .update_expression(format!("ADD {} :d", KEY_CONSUMERS))
                     .expression_attribute_values(":d", AttributeValue::Ss(vec![consumer_key.clone()]))
                     .condition_expression(format!("attribute_exists({})", KEY_PACKAGE_NAME)).send().await {
@@ -180,7 +188,7 @@ impl CrateMetadataUpdater {
         }
     }
 
-    async fn update_project(&self, crt: &CrateHelper, build_details: &BuildDetails, tracked_deps: Vec<String>) -> Result<(), crate_helper::Error> {
+    async fn update_project(&self, pkg_key: &PackageKey, build_details: &BuildDetails, tracked_deps: Vec<String>) -> Result<(), crate_helper::Error> {
         // TODO: Always update the specific version.
         // We won't (and shouldn't) try and rebuild all projects that would consume a new version as
         // the actual versions being used by the consumer should be locked, until it's rebuilt, at
@@ -200,7 +208,7 @@ impl CrateMetadataUpdater {
 
         match self.ddb.update_item()
             .table_name(self.pkg_metadata_table.clone())
-            .set_key(Some(get_primary_key(&crt.name(), &crt.version())))
+            .set_key(Some(pkg_key.ddb_primary_key()))
             .attribute_updates(KEY_CODE_BUILD_PROJECT_NAME,
                                AttributeValueUpdate::builder()
                                    .value(AttributeValue::S(build_details.build_project_name.clone()))
@@ -216,8 +224,8 @@ impl CrateMetadataUpdater {
                             // Clean up old dependencies that should no longer exist.
                             let mut dep_rm_futures = vec![];
                             for old_dep in old_deps_set.difference(&tracked_deps_set) {
-                                match PackageKey::from(&old_dep) {
-                                    Ok(old_dep_key) => dep_rm_futures.push(Box::pin(self.rm_consumer_from_dependency(&crt, old_dep_key))),
+                                match PackageKey::from_fq_key(&old_dep) {
+                                    Ok(old_dep_key) => dep_rm_futures.push(Box::pin(self.rm_consumer_from_dependency(&pkg_key, old_dep_key))),
                                     Err(err) => return Err(err),
                                 }
                             }
@@ -234,7 +242,7 @@ impl CrateMetadataUpdater {
                             println!("Consumers: {:?}", consumers_av);
                             let mut project_build_futures = vec![];
                             for consumer_key in consumers {
-                                project_build_futures.push(Box::pin(self.rebuild_consumer(&crt, consumer_key)));
+                                project_build_futures.push(Box::pin(self.rebuild_consumer(&pkg_key, consumer_key)));
                             }
                             match try_join_all(project_build_futures).await {
                                 Ok(_) => (),
@@ -253,8 +261,8 @@ impl CrateMetadataUpdater {
         }
     }
 
-    async fn rm_consumer_from_dependency(&self, crt: &CrateHelper, old_dep_key: PackageKey) -> Result<(), crate_helper::Error> {
-        let consumer_key = get_encoded_primary_key(&crt.name(), &crt.version());
+    async fn rm_consumer_from_dependency(&self, pkg_key: &PackageKey, old_dep_key: PackageKey) -> Result<(), crate_helper::Error> {
+        let consumer_key = pkg_key.to_fq_key();
         let fq_dep_key = old_dep_key.to_fq_key();
         eprintln!("Trying to remove {} as consumer of {}.", consumer_key, fq_dep_key);
         let dep_primary_key = old_dep_key.ddb_primary_key();
@@ -286,12 +294,12 @@ impl CrateMetadataUpdater {
         }
     }
 
-    async fn rebuild_consumer(&self, crt: &CrateHelper, consumer_key: &String) -> Result<(), crate_helper::Error> {
-        let primary_key = get_encoded_primary_key(&crt.name(), &crt.version());
+    async fn rebuild_consumer(&self, pkg_key: &PackageKey, consumer_key: &String) -> Result<(), crate_helper::Error> {
+        let primary_key = pkg_key.to_fq_key();
         eprintln!("Checking to see if {} needs to be rebuilt due to update to {}.", consumer_key, primary_key);
         match self.ddb.get_item()
             .table_name(String::from(self.pkg_metadata_table.clone()))
-            .set_key(Some(get_primary_key(&crt.name(), &crt.version())))
+            .set_key(Some(pkg_key.ddb_primary_key()))
             .send().await {
             Ok(response) => {
                 eprintln!("Found record for {}: {:?}", consumer_key, response);
