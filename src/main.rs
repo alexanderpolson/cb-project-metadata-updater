@@ -12,9 +12,14 @@ const ENV_PKG_METADATA_TABLE: &str = "PKG_METADATA_TABLE";
 
 #[tokio::main]
 async fn main() {
+    // TODO: Add command-line arguments
+    // https://doc.rust-lang.org/book/ch12-01-accepting-command-line-arguments.html
     match update_metadata().await {
         Ok(_) => (),
-        Err(err) => eprintln!("ERROR: {}", err.msg)
+        Err(err) => {
+            eprintln!("ERROR: {}", err.msg);
+            std::process::exit(1)
+        }
     }
 }
 
