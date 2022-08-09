@@ -296,7 +296,15 @@ impl CrateMetadataUpdater {
     async fn rebuild_consumer(&self, pkg_key: &PackageKey, consumer_key: &String) -> Result<(), crate_helper::Error> {
         let primary_key = pkg_key.to_fq_key();
         eprintln!("Checking to see if {} needs to be rebuilt due to update to {}.", consumer_key, primary_key);
+
+        // For some reason, this get_item call isn't returning the dependencies attribute.
+        let mut attrs_to_get = Vec::new();
+        attrs_to_get.push(String::from("package_name"));
+        attrs_to_get.push(String::from("version"));
+        attrs_to_get.push(String::from("code_build_project_name"));
+        attrs_to_get.push(String::from("dependencies"));
         match self.ddb.get_item()
+            .set_attributes_to_get(Some(attrs_to_get))
             .table_name(String::from(self.pkg_metadata_table.clone()))
             .set_key(Some(pkg_key.ddb_primary_key()))
             .send().await {
