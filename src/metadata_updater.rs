@@ -189,7 +189,6 @@ impl CrateMetadataUpdater {
     }
 
     async fn update_project(&self, pkg_key: &PackageKey, build_details: &BuildDetails, tracked_deps: Vec<String>) -> Result<(), crate_helper::Error> {
-        // TODO: Always update the specific version.
         // We won't (and shouldn't) try and rebuild all projects that would consume a new version as
         // the actual versions being used by the consumer should be locked, until it's rebuilt, at
         // which point, it will grab the appropriate version and add itself as a consumer to that
@@ -302,13 +301,17 @@ impl CrateMetadataUpdater {
             .set_key(Some(pkg_key.ddb_primary_key()))
             .send().await {
             Ok(response) => {
+                // TODO: This is not kicking off builds properly.
                 eprintln!("Found record for {}: {:?}", consumer_key, response);
                 if let Some(item) = response.item {
+                    eprintln!("Found item: {:?}", item);
                     if let Some(dependencies_av) = item.get(KEY_DEPENDENCIES) {
                         if let Ok(dependencies) = dependencies_av.as_ss() {
                             eprintln!("Found the following dependencies for {}: {:?}", primary_key, dependencies);
                             if dependencies.contains(&primary_key) {
+                                eprintln!("Dependencies contains {}", primary_key);
                                 if let Some(cb_build_project_av) = item.get(KEY_CODE_BUILD_PROJECT_NAME) {
+                                    eprintln!("Found CodeBuildProject AttributeValue: {:?}", cb_build_project_av);
                                     if let Ok(cb_build_project_name) = cb_build_project_av.as_s() {
                                         return match self.codebuild.start_build().project_name(cb_build_project_name).send().await {
                                             Ok(_) => {
@@ -318,7 +321,11 @@ impl CrateMetadataUpdater {
                                             Err(err) => return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
                                         }
                                     }
+                                } else {
+                                    eprintln!("Didn't find CodeBuildProject AttributeValue.");
                                 }
+                            } else {
+                                eprintln!("Dependencies does not contain {}", primary_key);
                             }
                         }
                     }
