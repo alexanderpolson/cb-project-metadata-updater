@@ -7,4 +7,4 @@ phases:
   build:
     on-failure: ABORT
     commands:
-      - release
+      - rust-bin-release
