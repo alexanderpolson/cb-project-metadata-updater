@@ -299,8 +299,6 @@ impl CrateMetadataUpdater {
     async fn rebuild_consumer(&self, dependency_key: &PackageKey, consumer_key: PackageKey) -> Result<(), crate_helper::Error> {
         eprintln!("Checking to see if {:?} needs to be rebuilt due to update to {:?}.", consumer_key, dependency_key);
 
-        // TODO: Get the consumer key, not the primary key.
-        // For some reason, this get_item call isn't returning the dependencies attribute.
         match self.ddb.get_item()
             .table_name(String::from(self.pkg_metadata_table.clone()))
             .set_key(Some(consumer_key.ddb_primary_key()))
