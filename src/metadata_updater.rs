@@ -205,6 +205,7 @@ impl CrateMetadataUpdater {
                 .value(AttributeValue::Ss(tracked_deps))
         }.build();
 
+        // TODO: Don't update project name if local build is being executed (project name is "local")
         match self.ddb.update_item()
             .table_name(self.pkg_metadata_table.clone())
             .set_key(Some(pkg_key.ddb_primary_key()))
