@@ -30,6 +30,7 @@ pub struct BuildDetails {
     pub build_project_name: String
 }
 
+#[derive(Debug)]
 pub struct PackageKey {
     pub build_system: String,
     pub name: String,
@@ -241,7 +242,8 @@ impl CrateMetadataUpdater {
                         if let Ok(consumers) = consumers_av.as_ss() {
                             println!("Consumers: {:?}", consumers_av);
                             let mut project_build_futures = vec![];
-                            for consumer_key in consumers {
+                            for fq_consumer_key in consumers {
+                                let consumer_key = PackageKey::from_fq_key(&fq_consumer_key)?;
                                 project_build_futures.push(Box::pin(self.rebuild_consumer(&pkg_key, consumer_key)));
                             }
                             match try_join_all(project_build_futures).await {
@@ -294,37 +296,31 @@ impl CrateMetadataUpdater {
         }
     }
 
-    async fn rebuild_consumer(&self, pkg_key: &PackageKey, consumer_key: &String) -> Result<(), crate_helper::Error> {
-        let primary_key = pkg_key.to_fq_key();
-        eprintln!("Checking to see if {} needs to be rebuilt due to update to {}.", consumer_key, primary_key);
+    async fn rebuild_consumer(&self, dependency_key: &PackageKey, consumer_key: PackageKey) -> Result<(), crate_helper::Error> {
+        eprintln!("Checking to see if {:?} needs to be rebuilt due to update to {:?}.", consumer_key, dependency_key);
 
+        // TODO: Get the consumer key, not the primary key.
         // For some reason, this get_item call isn't returning the dependencies attribute.
-        let mut attrs_to_get = Vec::new();
-        attrs_to_get.push(String::from("package_name"));
-        attrs_to_get.push(String::from("version"));
-        attrs_to_get.push(String::from("code_build_project_name"));
-        attrs_to_get.push(String::from("dependencies"));
         match self.ddb.get_item()
-            .set_attributes_to_get(Some(attrs_to_get))
             .table_name(String::from(self.pkg_metadata_table.clone()))
-            .set_key(Some(pkg_key.ddb_primary_key()))
+            .set_key(Some(consumer_key.ddb_primary_key()))
             .send().await {
             Ok(response) => {
                 // TODO: This is not kicking off builds properly.
-                eprintln!("Found record for {}: {:?}", consumer_key, response);
+                eprintln!("Found record for {:?}: {:?}", consumer_key, response);
                 if let Some(item) = response.item {
                     eprintln!("Found item: {:?}", item);
                     if let Some(dependencies_av) = item.get(KEY_DEPENDENCIES) {
                         if let Ok(dependencies) = dependencies_av.as_ss() {
-                            eprintln!("Found the following dependencies for {}: {:?}", primary_key, dependencies);
-                            if dependencies.contains(&primary_key) {
-                                eprintln!("Dependencies contains {}", primary_key);
+                            eprintln!("Found the following dependencies for {:?}: {:?}", consumer_key, dependencies);
+                            if dependencies.contains(&dependency_key.to_fq_key()) {
+                                eprintln!("Dependencies contains {:?}", dependency_key);
                                 if let Some(cb_build_project_av) = item.get(KEY_CODE_BUILD_PROJECT_NAME) {
                                     eprintln!("Found CodeBuildProject AttributeValue: {:?}", cb_build_project_av);
                                     if let Ok(cb_build_project_name) = cb_build_project_av.as_s() {
                                         return match self.codebuild.start_build().project_name(cb_build_project_name).send().await {
                                             Ok(_) => {
-                                                eprintln!("Kicked off rebuild of consumer {} (CB project {}", consumer_key, cb_build_project_name);
+                                                eprintln!("Kicked off rebuild of consumer {:?} (CB project {}", consumer_key, cb_build_project_name);
                                                 Ok(())
                                             },
                                             Err(err) => return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
@@ -334,7 +330,7 @@ impl CrateMetadataUpdater {
                                     eprintln!("Didn't find CodeBuildProject AttributeValue.");
                                 }
                             } else {
-                                eprintln!("Dependencies does not contain {}", primary_key);
+                                eprintln!("Dependencies does not contain {:?}", dependency_key);
                             }
                         }
                     }
