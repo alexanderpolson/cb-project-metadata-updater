@@ -5,7 +5,7 @@ repository  = "https://github.com/alexanderpolson/cb-project-metadata-updater"
 documentation = "https://github.com/alexanderpolson/cb-project-metadata-updater"
 description = "Tracks relationships between source code and their AWS Code Build projects to coordinate rebuilds of consumers when changes are made."
 license = "MIT"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

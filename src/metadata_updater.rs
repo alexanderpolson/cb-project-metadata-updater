@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use aws_config::Config;
-use aws_sdk_codebuild::{Client as CodeBuildClient};
+use aws_sdk_codebuild::{Client as CodeBuildClient, SdkError};
+use aws_sdk_codebuild::error::StartBuildErrorKind;
 use aws_sdk_dynamodb::{Client as DynamoDbClient, SdkError as DynamoDbError};
 use aws_sdk_dynamodb::model::{AttributeAction, AttributeValue, AttributeValueUpdate, ReturnValue};
 use futures::future::try_join_all;
@@ -321,7 +322,25 @@ impl CrateMetadataUpdater {
                                                 eprintln!("Kicked off rebuild of consumer {:?} (CB project {}", consumer_key, cb_build_project_name);
                                                 Ok(())
                                             },
-                                            Err(err) => return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
+                                            Err(err) => {
+                                                // TODO: Clean up this mess so there isn't any duplication.
+                                                match err {
+                                                    SdkError::ServiceError { err, .. } => {
+                                                        match err.kind {
+                                                            StartBuildErrorKind::ResourceNotFoundException(_) => {
+                                                                eprintln!("Can't find a CodeBuild project named {}. Skipping", cb_build_project_name);
+                                                                return Ok(());
+                                                            },
+                                                            _ => {
+                                                                return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
+                                                            },
+                                                        }
+                                                    },
+                                                    _ => {
+                                                        return Err(crate_helper::Error::with_msg(format!("ERROR: {}", err.to_string())))
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 } else {
